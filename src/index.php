@@ -24,8 +24,8 @@ function oldArr(string $key): array
 function checked($cond): string { return $cond ? 'checked' : ''; }
 function selected($cond): string { return $cond ? 'selected' : ''; }
 
-// Справочники (под твои enum VALUES, маппятся по строкам)
-$WORK_TYPES = ['Проектирование','Вентиляция и кондиционирование','Отопление','Водоснабжение','Электрика'];
+// Справочники (маппятся по VALUE — под твои enum)
+$WORK_TYPES  = ['Проектирование','Вентиляция и кондиционирование','Отопление','Водоснабжение','Электрика'];
 $PLACE_TYPES = ['Квартира','Дом','Офис','Производство'];
 
 // Обработка сабмита
@@ -36,11 +36,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     try {
         $bx = new BitrixClient(BX_WEBHOOK);
 
-        $mode         = $_POST['mode']         ?? 'lead';     // lead|deal
-        $subjectType  = $_POST['subject_type'] ?? 'person';   // person|company
+        $mode        = $_POST['mode']         ?? 'lead';     // lead|deal
+        $subjectType = $_POST['subject_type'] ?? 'person';   // person|company
+
+        // Жёсткий серверный предохранитель: для юрика сделку не создаём
+        if ($subjectType === 'company') {
+            $mode = 'lead';
+        }
 
         // subject
-        $subject = [];
         if ($subjectType === 'company') {
             $subject = [
                 'type'          => 'company',
@@ -71,9 +75,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'area'            => $_POST['area']   ?? null,
             'amount'          => $_POST['amount'] ?? null,
             'has_design'      => isset($_POST['has_design']),
-            'payment_purpose' => $_POST['payment_purpose'] ?? null,
+            'payment_purpose' => $subjectType === 'company' ? ($_POST['payment_purpose'] ?? null) : null,
             'currency'        => $_POST['currency'] ?? DEFAULT_CURRENCY,
-            // 'UF_CRM_...' => $_POST['...'], // если захочешь передавать дополнительные UF
         ];
 
         // extra
@@ -85,13 +88,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $title = trim((string)($_POST['title'] ?? 'Заявка с формы'));
 
         if ($mode === 'deal') {
-            // Параметры воронки сделки
+            // только для физлиц
             $extra['CATEGORY_ID'] = (int)($_POST['deal_category_id'] ?? DEFAULT_DEAL_CAT_ID);
             $extra['STAGE_ID']    = $_POST['deal_stage_id'] ?? DEFAULT_DEAL_STAGE;
             $result = $bx->createDefaultDealSafe($title, $subject, $data, $extra);
         } else {
-            // Лид всегда первичный (твоя версия метода не создаёт контакт/компанию)
-            // Можно подставить статус, если нужно: $extra['STATUS_ID'] = 'NEW';
             $result = $bx->createDefaultLeadSafe($title, $subject, $data, $extra);
         }
 
@@ -146,8 +147,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   .note.ok{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.35)}
   .note.err{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35)}
   .gridline{border-top:1px dashed #233047;margin:18px 0}
-  .two{display:flex;gap:12px;flex-wrap:wrap}
-  .two > * {flex:1}
   .muted{color:#97a3b7}
   .footer{opacity:.7;font-size:12px;margin-top:14px}
 </style>
@@ -171,12 +170,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <div class="row">
           <div class="col-6">
             <label>Что создаём</label>
-            <div class="switch">
+            <div class="switch" id="modeSwitch">
               <label>
                 <input type="radio" name="mode" value="lead" <?= checked(($_POST['mode'] ?? 'lead') === 'lead') ?> />
                 <span class="pill">Лид</span>
               </label>
-              <label>
+              <label id="dealOption">
                 <input type="radio" name="mode" value="deal" <?= checked(($_POST['mode'] ?? '') === 'deal') ?> />
                 <span class="pill">Сделка</span>
               </label>
@@ -310,12 +309,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
           <div class="col-12 actions">
             <button class="btn primary" type="submit">Отправить в Bitrix</button>
-            <div class="muted">мы не создаём контакт/компанию для ЛИДА — первичный по инструкции</div>
+            <div class="muted"></div>
           </div>
         </div>
       </form>
 
-      <div class="footer">UI — без внешних библиотек. Поля маппятся по VALUE, Bitrix сам резолвит ID через ваш класс.</div>
+      <div class="footer"></div>
     </div>
   </div>
 </div>
@@ -323,17 +322,110 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <script>
 (function(){
   const form = document.getElementById('crmForm');
-  const toggle = () => {
-    const mode = form.mode.value; // lead|deal
-    const subj = form.subject_type.value; // person|company
-    document.querySelectorAll('.deal-only').forEach(el => el.style.display = (mode==='deal') ? '' : 'none');
-    document.querySelectorAll('.person-only').forEach(el => el.style.display = (subj==='person') ? '' : 'none');
-    document.querySelectorAll('.company-only').forEach(el => el.style.display = (subj==='company') ? '' : 'none');
-  };
-  form.mode.forEach ? form.mode.forEach(r => r.addEventListener('change', toggle))
-                    : Array.from(form.querySelectorAll('input[name="mode"]')).forEach(r=>r.addEventListener('change', toggle));
-  Array.from(form.querySelectorAll('input[name="subject_type"]')).forEach(r=>r.addEventListener('change', toggle));
+
+  function qsa(s){ return Array.from(document.querySelectorAll(s)); }
+
+  function showGroup(selector, show) {
+    qsa(selector).forEach(el => el.style.display = show ? '' : 'none');
+  }
+  function setDisabled(selector, disabled) {
+    qsa(selector).forEach(group => {
+      group.querySelectorAll('input, select, textarea, button').forEach(ctrl => {
+        if (disabled) ctrl.setAttribute('disabled','disabled'); else ctrl.removeAttribute('disabled');
+      });
+    });
+  }
+  function clearGroup(selector) {
+    qsa(selector).forEach(group => {
+      group.querySelectorAll('input, select, textarea').forEach(ctrl => {
+        if (ctrl.name === 'mode' || ctrl.name === 'subject_type') return; // переключатели не трогаем
+        const tag = ctrl.tagName.toLowerCase();
+        const type = (ctrl.type || '').toLowerCase();
+        if (type === 'checkbox' || type === 'radio') {
+          ctrl.checked = false;
+        } else if (tag === 'select') {
+          if (ctrl.multiple) {
+            Array.from(ctrl.options).forEach(o => o.selected = false);
+          } else {
+            // если есть пустой option — на него
+            const empty = Array.from(ctrl.options).find(o => o.value === '');
+            if (empty) { ctrl.value = ''; } else { ctrl.selectedIndex = 0; }
+          }
+        } else {
+          ctrl.value = '';
+        }
+      });
+    });
+  }
+
+  function current(name){
+    const el = form.querySelector(`input[name="${name}"]:checked`);
+    return el ? el.value : null;
+  }
+
+  function forceLeadIfCompany() {
+    const subj = current('subject_type');
+    const dealLabel = document.getElementById('dealOption');
+    const dealRadio = dealLabel.querySelector('input[name="mode"][value="deal"]');
+    const leadRadio = form.querySelector('input[name="mode"][value="lead"]');
+
+    if (subj === 'company') {
+      // скрыть «Сделка», форсить «Лид»
+      dealLabel.style.display = 'none';
+      dealRadio.checked = false;
+      leadRadio.checked = true;
+      // и подчистить deal-only
+      clearGroup('.deal-only'); setDisabled('.deal-only', true); showGroup('.deal-only', false);
+    } else {
+      dealLabel.style.display = '';
+    }
+  }
+
+  function toggle() {
+    const mode = current('mode') || 'lead';
+    const subj = current('subject_type') || 'person';
+
+    // визуальные группы
+    showGroup('.deal-only',   mode === 'deal' && subj !== 'company'); // на всякий случай
+    showGroup('.person-only', subj === 'person');
+    showGroup('.company-only',subj === 'company');
+
+    // disable + clear для неактивных групп
+    if (mode !== 'deal') { clearGroup('.deal-only'); setDisabled('.deal-only', true); }
+    else                 { setDisabled('.deal-only', false); }
+
+    if (subj !== 'person') { clearGroup('.person-only'); setDisabled('.person-only', true); }
+    else                   { setDisabled('.person-only', false); }
+
+    if (subj !== 'company'){ clearGroup('.company-only'); setDisabled('.company-only', true); }
+    else                   { setDisabled('.company-only', false); }
+
+    // бизнес-правило: юрику сделку не даём
+    forceLeadIfCompany();
+  }
+
+  // навешиваем
+  qsa('input[name="mode"]').forEach(r => r.addEventListener('change', toggle));
+  qsa('input[name="subject_type"]').forEach(r => r.addEventListener('change', toggle));
+
+  // первичный запуск
   toggle();
+
+  // Доп. страховка перед submit — автоочистка скрытых (если юзер схитрит devtools'ом)
+  form.addEventListener('submit', () => {
+    // если юрлицо — точно форсим lead
+    const subj = current('subject_type');
+    if (subj === 'company') {
+      const lead = form.querySelector('input[name="mode"][value="lead"]');
+      lead.checked = true;
+    }
+    // ещё раз подчистим скрытое
+    const hiddenSelectors = [];
+    if (current('mode') !== 'deal')   hiddenSelectors.push('.deal-only');
+    if (current('subject_type') !== 'person') hiddenSelectors.push('.person-only');
+    if (current('subject_type') !== 'company') hiddenSelectors.push('.company-only');
+    hiddenSelectors.forEach(sel => { clearGroup(sel); setDisabled(sel, true); });
+  });
 })();
 </script>
 </body>
