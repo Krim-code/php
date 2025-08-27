@@ -1,692 +1,340 @@
 <?php
+// index.php
 declare(strict_types=1);
 
-final class BitrixClient
+// === Конфиг ===
+const BX_WEBHOOK          = 'https://b24-7d59hz.bitrix24.ru/rest/1/lcupf1tphfngxpnt'; // <<-- замени
+const DEFAULT_ASSIGNED_ID = 1;
+const DEFAULT_SOURCE_ID   = 'WEB';
+const DEFAULT_DEAL_CAT_ID = 0;
+const DEFAULT_DEAL_STAGE  = 'NEW';
+const DEFAULT_CURRENCY    = 'RUB';
+
+require_once __DIR__ . '/BitrixClient.php';
+
+function old(string $key, $default = '')
 {
-    private string $baseUrl;
-    private ?array $dealFieldsCache = null;
-    private ?array $leadFieldsCache = null;
-    private ?array $companyFieldsCache = null;
+    return htmlspecialchars($_POST[$key] ?? $default, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+function oldArr(string $key): array
+{
+    $v = $_POST[$key] ?? [];
+    return is_array($v) ? $v : [$v];
+}
+function checked($cond): string { return $cond ? 'checked' : ''; }
+function selected($cond): string { return $cond ? 'selected' : ''; }
 
-    /* ===== UF коды: Сделка ===== */
-    private const UF_WORK_TYPES_DEAL        = 'UF_CRM_1755625105555'; // enum multiple: Виды работ
-    private const UF_PLACE_TYPE_DEAL        = 'UF_CRM_1755625205341'; // enum: Тип помещения
-    private const UF_AREA_DEAL              = 'UF_CRM_1755625259983'; // double: Площадь
-    // private const UF_LEGAL_SUMMARY_DEAL     = 'UF_CRM_1755634129009'; // string: Юр. сводка
-    private const UF_PAYMENT_PURPOSE_DEAL   = 'UF_CRM_1755635797930'; // string: Назначение платежа
-    private const UF_HAS_DESIGN_DEAL        = 'UF_CRM_1756305031525'; // boolean: Наличие ДП/планировки
-    private const UF_PAID_DEAL              = 'UF_CRM_1756297456738'; // boolean: Оплачено (если пригодится)
+// Справочники (под твои enum VALUES, маппятся по строкам)
+$WORK_TYPES = ['Проектирование','Вентиляция и кондиционирование','Отопление','Водоснабжение','Электрика'];
+$PLACE_TYPES = ['Квартира','Дом','Офис','Производство'];
 
-    /* ===== UF коды: Лид ===== */
-    private const UF_WORK_TYPES_LEAD        = 'UF_CRM_1756233341';    // enum multiple: Виды работ
-    private const UF_PLACE_TYPE_LEAD        = 'UF_CRM_1756234012227'; // enum: Тип помещения
-    private const UF_AREA_LEAD              = 'UF_CRM_1756234049657'; // double: Площадь
-    private const UF_LEGAL_SUMMARY_LEAD     = 'UF_CRM_1756237988929'; // string: Данные Юр Лица (сводка)
-    private const UF_PAYMENT_PURPOSE_LEAD   = 'UF_CRM_1756297123947'; // string: Назначение платежа
-    private const UF_INN_LEAD               = 'UF_CRM_1756297158897'; // string: ИНН
-    private const UF_LEGAL_ADDRESS_LEAD     = 'UF_CRM_1756304797452'; // address: Юридический адрес (строка ок)
-    private const UF_HAS_DESIGN_LEAD        = 'UF_CRM_1756305002991'; // boolean: Наличие ДП/планировки
+// Обработка сабмита
+$result = null;
+$error  = null;
 
-    public function __construct(string $baseWebhookUrl)
-    {
-        $this->baseUrl = rtrim($baseWebhookUrl, '/') . '/';
-    }
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    try {
+        $bx = new BitrixClient(BX_WEBHOOK);
 
-    /* ==================== ПУБЛИЧКА ==================== */
+        $mode         = $_POST['mode']         ?? 'lead';     // lead|deal
+        $subjectType  = $_POST['subject_type'] ?? 'person';   // person|company
 
-    /** Сделка: антидубли контакта/компании + создание сделки */
-    public function createDefaultDealSafe(string $title, array $subject, array $data = [], array $extra = []): array
-    {
-        try {
-            $id = $this->createDefaultDeal($title, $subject, $data, $extra);
-            return ['ok' => true, 'id' => $id];
-        } catch (Throwable $e) {
-            return ['ok' => false, 'error' => $e->getMessage()];
-        }
-    }
-
-    /** Лид: реюз открытого лида по телефону/почте (повторный) либо создание нового */
-    public function createDefaultLeadSafe(string $title, array $subject, array $data = [], array $extra = []): array
-    {
-        try {
-            $id = $this->createDefaultLead($title, $subject, $data, $extra);
-            return ['ok' => true, 'id' => $id];
-        } catch (Throwable $e) {
-            return ['ok' => false, 'error' => $e->getMessage()];
-        }
-    }
-
-    /* ==================== ВНУТРЯНКА: СДЕЛКА ==================== */
-
-    private function createDefaultDeal(string $title, array $subject, array $data, array $extra): int
-    {
-        [$contactId, $companyId, $phoneNorm, $emailNorm, $inn, $titleCmp] = $this->resolveSubjectEntities($subject);
-
-        // UF для сделки
-        $uf = [];
-        if (array_key_exists('work_types', $data)) $uf[self::UF_WORK_TYPES_DEAL] = $data['work_types'];
-        if (array_key_exists('place_type', $data)) $uf[self::UF_PLACE_TYPE_DEAL] = $data['place_type'];
-        if (array_key_exists('area', $data))       $uf[self::UF_AREA_DEAL]       = $data['area'];
-        if (!empty($data['payment_purpose']))      $uf[self::UF_PAYMENT_PURPOSE_DEAL] = (string)$data['payment_purpose'];
-        if (array_key_exists('has_design', $data)) $uf[self::UF_HAS_DESIGN_DEAL]      = $this->toBool($data['has_design']);
-        if (array_key_exists('paid', $data))       $uf[self::UF_PAID_DEAL]            = $this->toBool($data['paid']); // опционально
-
-        // автоподхват любых UF_CRM_* из $data
-        foreach ($data as $k => $v) {
-            if (is_string($k) && strncmp($k, 'UF_CRM_', 7) === 0 && !array_key_exists($k, $uf)) $uf[$k] = $v;
-        }
-
-        // Юр.сводка (если юрлицо/есть подсказки)
-        // $hasCompanyHints = ($companyId !== null) || !empty($titleCmp) || !empty($inn) || (($subject['type'] ?? '') === 'company');
-        // if ($hasCompanyHints) {
-        //     $addrStr = trim((string)($subject['legal_address'] ?? $data['legal_address'] ?? ''));
-        //     $uf[self::UF_LEGAL_SUMMARY_DEAL] = $this->formatCompanySummary(
-        //         (string)($titleCmp ?? ''), (string)($inn ?? ''), (string)($phoneNorm ?? ''), (string)($emailNorm ?? ''), $addrStr
-        //     );
-        // }
-
-        // Сумма/валюта
-        $amount   = $this->parseFloatOrNull($data['amount'] ?? null);
-        $currency = strtoupper((string)($data['currency'] ?? 'RUB'));
-
-        $fields = array_merge([
-            'TITLE'  => $title,
-            'OPENED' => 'Y',
-        ], $extra);
-
-        if ($contactId)        $fields['CONTACT_ID'] = $contactId; // для сделок ок
-        if ($companyId)        $fields['COMPANY_ID'] = $companyId;
-        if ($amount !== null)  $fields['OPPORTUNITY'] = $amount;
-        if ($currency !== '')  $fields['CURRENCY_ID'] = $currency;
-
-        // маппинг UF
-        $fields = array_merge($fields, $this->resolveUserFields($uf, $this->getDealFields()));
-
-        $resp = $this->call('crm.deal.add', ['fields' => $fields]);
-        if (!isset($resp['result']) || !is_int($resp['result'])) {
-            $msg = $resp['error_description'] ?? 'Unknown Bitrix response';
-            throw new RuntimeException("Failed to create deal: {$msg}");
-        }
-        return $resp['result'];
-    }
-
-    /* ==================== ВНУТРЯНКА: ЛИД ==================== */
-
-        private function createDefaultLead(string $title, array $subject, array $data, array $extra): int
-    {
-        // НИКАКИХ контактов/компаний — только поля лида
-        $phoneNorm = isset($subject['phone']) ? $this->normalizePhone((string)$subject['phone']) : null;
-        $emailNorm = isset($subject['email']) ? $this->normalizeEmail((string)$subject['email']) : null;
-        $inn       = isset($subject['inn'])   ? trim((string)$subject['inn'])                     : null;
-        $titleCmp  = isset($subject['title']) ? trim((string)$subject['title'])                   : null;
-
-        // Собираем UF для лида
-        $uf = [];
-        if (array_key_exists('work_types', $data)) $uf[self::UF_WORK_TYPES_LEAD]      = $data['work_types'];
-        if (array_key_exists('place_type', $data)) $uf[self::UF_PLACE_TYPE_LEAD]      = $data['place_type'];
-        if (array_key_exists('area', $data))       $uf[self::UF_AREA_LEAD]            = $data['area'];
-        if (!empty($data['payment_purpose']))      $uf[self::UF_PAYMENT_PURPOSE_LEAD] = (string)$data['payment_purpose'];
-        if (!empty($inn))                           $uf[self::UF_INN_LEAD]             = (string)$inn;
-        if (!empty($subject['legal_address']) || !empty($data['legal_address'])) {
-            $uf[self::UF_LEGAL_ADDRESS_LEAD] = (string)($subject['legal_address'] ?? $data['legal_address']);
-        }
-        if (array_key_exists('has_design', $data))  $uf[self::UF_HAS_DESIGN_LEAD]     = $this->toBool($data['has_design']);
-
-        // автоподхват любых UF_CRM_* из $data
-        foreach ($data as $k => $v) {
-            if (is_string($k) && strncmp($k, 'UF_CRM_', 7) === 0 && !array_key_exists($k, $uf)) {
-                $uf[$k] = $v;
+        // subject
+        $subject = [];
+        if ($subjectType === 'company') {
+            $subject = [
+                'type'          => 'company',
+                'title'         => trim((string)($_POST['company_title'] ?? '')),
+                'inn'           => trim((string)($_POST['inn'] ?? '')),
+                'phone'         => trim((string)($_POST['phone'] ?? '')),
+                'email'         => trim((string)($_POST['email'] ?? '')),
+                'legal_address' => trim((string)($_POST['legal_address'] ?? '')),
+            ];
+            if ($subject['title'] === '') {
+                throw new InvalidArgumentException('Укажи название компании.');
+            }
+        } else {
+            $subject = [
+                'name'  => trim((string)($_POST['name'] ?? '')),
+                'phone' => trim((string)($_POST['phone'] ?? '')),
+                'email' => trim((string)($_POST['email'] ?? '')),
+            ];
+            if ($subject['name'] === '') {
+                throw new InvalidArgumentException('Имя обязательно.');
             }
         }
 
-        // Человекочитаемая юр.сводка — только в UF лида
-        $hasCompanyHints = !empty($titleCmp) || !empty($inn) || (($subject['type'] ?? '') === 'company');
-        if ($hasCompanyHints) {
-            $addrStr = trim((string)($subject['legal_address'] ?? $data['legal_address'] ?? ''));
-            $uf[self::UF_LEGAL_SUMMARY_LEAD] = $this->formatCompanySummary(
-                (string)($titleCmp ?? ''), (string)($inn ?? ''), (string)($phoneNorm ?? ''), (string)($emailNorm ?? ''), $addrStr
-            );
-        }
-
-        // Сумма/валюта (у лида есть эти поля)
-        $amount   = $this->parseFloatOrNull($data['amount'] ?? null);
-        $currency = strtoupper((string)($data['currency'] ?? 'RUB'));
-
-        // Базовые поля лида — БЕЗ CONTACT_IDS/COMPANY_ID
-        $fields = [
-            'TITLE'     => $title,
-            'OPENED'    => 'Y',
-            'STATUS_ID' => $extra['STATUS_ID'] ?? 'NEW', // дефолтная стадия
+        // data (UF)
+        $data = [
+            'work_types'      => array_values(array_intersect($WORK_TYPES, oldArr('work_types'))),
+            'place_type'      => in_array(($_POST['place_type'] ?? ''), $PLACE_TYPES, true) ? $_POST['place_type'] : null,
+            'area'            => $_POST['area']   ?? null,
+            'amount'          => $_POST['amount'] ?? null,
+            'has_design'      => isset($_POST['has_design']),
+            'payment_purpose' => $_POST['payment_purpose'] ?? null,
+            'currency'        => $_POST['currency'] ?? DEFAULT_CURRENCY,
+            // 'UF_CRM_...' => $_POST['...'], // если захочешь передавать дополнительные UF
         ];
-        foreach ($extra as $k => $v) {
-            if ($k !== 'STATUS_ID') $fields[$k] = $v;
+
+        // extra
+        $extra = [
+            'ASSIGNED_BY_ID' => (int)($_POST['assigned_by_id'] ?? DEFAULT_ASSIGNED_ID),
+            'SOURCE_ID'      => $_POST['source_id'] ?? DEFAULT_SOURCE_ID,
+        ];
+
+        $title = trim((string)($_POST['title'] ?? 'Заявка с формы'));
+
+        if ($mode === 'deal') {
+            // Параметры воронки сделки
+            $extra['CATEGORY_ID'] = (int)($_POST['deal_category_id'] ?? DEFAULT_DEAL_CAT_ID);
+            $extra['STAGE_ID']    = $_POST['deal_stage_id'] ?? DEFAULT_DEAL_STAGE;
+            $result = $bx->createDefaultDealSafe($title, $subject, $data, $extra);
+        } else {
+            // Лид всегда первичный (твоя версия метода не создаёт контакт/компанию)
+            // Можно подставить статус, если нужно: $extra['STATUS_ID'] = 'NEW';
+            $result = $bx->createDefaultLeadSafe($title, $subject, $data, $extra);
         }
 
-        if (!empty($subject['name'])) $fields['NAME'] = trim((string)$subject['name']);
-        if (!empty($titleCmp))        $fields['COMPANY_TITLE'] = $titleCmp;
-
-        // Мультиполя — всегда при создании (мы не делаем update существующего лида)
-        if ($phoneNorm) $fields['PHONE'] = [['TYPE_ID' => 'PHONE', 'VALUE' => $phoneNorm, 'VALUE_TYPE' => 'WORK']];
-        if ($emailNorm) $fields['EMAIL'] = [['TYPE_ID' => 'EMAIL', 'VALUE' => $emailNorm, 'VALUE_TYPE' => 'WORK']];
-
-        if ($amount !== null) $fields['OPPORTUNITY'] = $amount;
-        if ($currency !== '') $fields['CURRENCY_ID'] = $currency;
-
-        // Приведение UF по метаданным лида (enum/double/boolean/address/…)
-        $fields = array_merge($fields, $this->resolveUserFields($uf, $this->getLeadFields()));
-
-        // Всегда создаём НОВЫЙ лид — «первичный»
-        $resp = $this->call('crm.lead.add', ['fields' => $fields]);
-        if (!isset($resp['result']) || !is_int($resp['result'])) {
-            $msg = $resp['error_description'] ?? 'Unknown Bitrix response';
-            throw new RuntimeException("Failed to create lead: {$msg}");
+        if (!($result['ok'] ?? false)) {
+            $error = $result['error'] ?? 'Unknown error';
         }
-        return $resp['result'];
-    }
-
-
-    /** вернуть открытый лид (STATUS_SEMANTIC_ID !== 'F') по телефону или почте */
-    private function findReusableLeadId(?string $phone, ?string $email): ?int
-    {
-        if ($phone) {
-            $r = $this->call('crm.lead.list', [
-                'filter' => ['PHONE' => $phone],
-                'select' => ['ID','STATUS_SEMANTIC_ID'],
-                'order'  => ['ID' => 'ASC'],
-            ]);
-            foreach ((array)($r['result'] ?? []) as $row) {
-                if (($row['STATUS_SEMANTIC_ID'] ?? '') !== 'F') return (int)$row['ID'];
-            }
-        }
-        if ($email) {
-            $r = $this->call('crm.lead.list', [
-                'filter' => ['EMAIL' => $email],
-                'select' => ['ID','STATUS_SEMANTIC_ID'],
-                'order'  => ['ID' => 'ASC'],
-            ]);
-            foreach ((array)($r['result'] ?? []) as $row) {
-                if (($row['STATUS_SEMANTIC_ID'] ?? '') !== 'F') return (int)$row['ID'];
-            }
-        }
-        return null;
-    }
-
-    /* ==================== АНТИДУБЛИ СУБЪЕКТОВ ==================== */
-
-    private function resolveSubjectEntities(array $subject): array
-    {
-        $contactId = !empty($subject['contact_id']) ? (int)$subject['contact_id'] : null;
-        $companyId = !empty($subject['company_id']) ? (int)$subject['company_id'] : null;
-
-        $phoneNorm = isset($subject['phone']) ? $this->normalizePhone((string)$subject['phone']) : null;
-        $emailNorm = isset($subject['email']) ? $this->normalizeEmail((string)$subject['email']) : null;
-        $inn       = isset($subject['inn'])   ? trim((string)$subject['inn'])                     : null;
-        $titleCmp  = isset($subject['title']) ? trim((string)$subject['title'])                   : null;
-
-        $hasCompanyHints = !empty($titleCmp) || !empty($inn) || (($subject['type'] ?? '') === 'company');
-        if (!$companyId && $hasCompanyHints) {
-            $companyId = $this->findCompanyIdByInnOrComm($inn, $phoneNorm, $emailNorm, $titleCmp);
-            if (!$companyId && $titleCmp) {
-                $companyId = $this->createCompany([
-                    'title' => $titleCmp,
-                    'phone' => $phoneNorm,
-                    'email' => $emailNorm,
-                    'inn'   => $inn,
-                ]);
-            }
-        }
-
-        if (!$contactId && !empty($subject['name'])) {
-            $contactId = $this->findContactIdByPhoneEmail($phoneNorm, $emailNorm);
-            if (!$contactId) {
-                $name = trim((string)$subject['name']);
-                if ($name === '') throw new InvalidArgumentException('Contact name is required');
-                $contactId = $this->createContact($name, $phoneNorm, $emailNorm);
-            }
-        }
-
-        return [$contactId, $companyId, $phoneNorm, $emailNorm, $inn, $titleCmp];
-    }
-
-    private function findContactIdByPhoneEmail(?string $phone, ?string $email): ?int
-    {
-        if ($phone) {
-            $r = $this->call('crm.contact.list', [
-                'filter' => ['PHONE' => $phone],
-                'select' => ['ID'],
-                'order'  => ['ID' => 'ASC'],
-            ]);
-            $id = $r['result'][0]['ID'] ?? null;
-            if ($id) return (int)$id;
-        }
-        if ($email) {
-            $r = $this->call('crm.contact.list', [
-                'filter' => ['EMAIL' => $email],
-                'select' => ['ID'],
-                'order'  => ['ID' => 'ASC'],
-            ]);
-            $id = $r['result'][0]['ID'] ?? null;
-            if ($id) return (int)$id;
-        }
-        return null;
-    }
-
-    private function findCompanyIdByInnOrComm(?string $inn, ?string $phone, ?string $email, ?string $title): ?int
-    {
-        if ($inn) {
-            $innUF = $this->guessCompanyInnUF();
-            if ($innUF) {
-                $r = $this->call('crm.company.list', [
-                    'filter' => [$innUF => $inn],
-                    'select' => ['ID'],
-                    'order'  => ['ID' => 'ASC'],
-                ]);
-                $id = $r['result'][0]['ID'] ?? null;
-                if ($id) return (int)$id;
-            }
-        }
-        if ($phone) {
-            $r = $this->call('crm.company.list', [
-                'filter' => ['PHONE' => $phone],
-                'select' => ['ID'],
-                'order'  => ['ID' => 'ASC'],
-            ]);
-            $id = $r['result'][0]['ID'] ?? null;
-            if ($id) return (int)$id;
-        }
-        if ($email) {
-            $r = $this->call('crm.company.list', [
-                'filter' => ['EMAIL' => $email],
-                'select' => ['ID'],
-                'order'  => ['ID' => 'ASC'],
-            ]);
-            $id = $r['result'][0]['ID'] ?? null;
-            if ($id) return (int)$id;
-        }
-        if ($title) {
-            $r = $this->call('crm.company.list', [
-                'filter' => ['TITLE' => $title],
-                'select' => ['ID'],
-                'order'  => ['ID' => 'ASC'],
-            ]);
-            $id = $r['result'][0]['ID'] ?? null;
-            if ($id) return (int)$id;
-        }
-        return null;
-    }
-
-    private function createContact(string $name, ?string $phone = null, ?string $email = null): int
-    {
-        $fields = ['NAME' => $name, 'OPENED' => 'Y'];
-        if ($phone && ($phone = $this->normalizePhone($phone))) $fields['PHONE'] = [['VALUE' => $phone, 'VALUE_TYPE' => 'WORK']];
-        if ($email) $fields['EMAIL'] = [['VALUE' => $this->normalizeEmail($email), 'VALUE_TYPE' => 'WORK']];
-
-        $resp = $this->call('crm.contact.add', ['fields' => $fields]);
-        if (!isset($resp['result']) || !is_int($resp['result'])) {
-            $msg = $resp['error_description'] ?? 'Unknown Bitrix response';
-            throw new RuntimeException("Failed to create contact: {$msg}");
-        }
-        return $resp['result'];
-    }
-
-    private function createCompany(array $c): int
-    {
-        $title = trim((string)($c['title'] ?? ''));
-        if ($title === '') throw new InvalidArgumentException('Company title is required');
-
-        $fields = ['TITLE' => $title, 'OPENED' => 'Y'];
-        if (!empty($c['phone']) && ($ph = $this->normalizePhone((string)$c['phone']))) {
-            $fields['PHONE'] = [['VALUE' => $ph, 'VALUE_TYPE' => 'WORK']];
-        }
-        if (!empty($c['email'])) {
-            $fields['EMAIL'] = [['VALUE' => $this->normalizeEmail((string)$c['email']), 'VALUE_TYPE' => 'WORK']];
-        }
-        if (!empty($c['inn'])) {
-            $innUF = $this->guessCompanyInnUF();
-            if ($innUF) $fields[$innUF] = (string)$c['inn'];
-        }
-
-        $resp = $this->call('crm.company.add', ['fields' => $fields]);
-        if (!isset($resp['result']) || !is_int($resp['result'])) {
-            $msg = $resp['error_description'] ?? 'Unknown Bitrix response';
-            throw new RuntimeException("Failed to create company: {$msg}");
-        }
-        return $resp['result'];
-    }
-
-    /* ==================== МЕТАДАННЫЕ/МАППИНГ ==================== */
-
-    private function getDealFields(): array
-    {
-        if ($this->dealFieldsCache !== null) return $this->dealFieldsCache;
-        $resp = $this->call('crm.deal.fields', []);
-        if (!isset($resp['result']) || !is_array($resp['result'])) throw new RuntimeException('Failed to fetch deal field metadata');
-        return $this->dealFieldsCache = $resp['result'];
-    }
-
-    private function getLeadFields(): array
-    {
-        if ($this->leadFieldsCache !== null) return $this->leadFieldsCache;
-        $resp = $this->call('crm.lead.fields', []);
-        if (!isset($resp['result']) || !is_array($resp['result'])) throw new RuntimeException('Failed to fetch lead field metadata');
-        return $this->leadFieldsCache = $resp['result'];
-    }
-
-    private function getCompanyFields(): array
-    {
-        if ($this->companyFieldsCache !== null) return $this->companyFieldsCache;
-        $resp = $this->call('crm.company.fields', []);
-        if (!isset($resp['result']) || !is_array($resp['result'])) throw new RuntimeException('Failed to fetch company field metadata');
-        return $this->companyFieldsCache = $resp['result'];
-    }
-
-    /** искать UF компании для ИНН по лейблам (ИНН/INN) */
-    private function guessCompanyInnUF(): ?string
-    {
-        $meta = $this->getCompanyFields();
-        foreach ($meta as $code => $m) {
-            if (strncmp($code, 'UF_CRM_', 7) !== 0) continue;
-            if (($m['type'] ?? 'string') !== 'string') continue;
-            $labels = $this->lower(trim(
-                (string)($m['title'] ?? '') . ' ' .
-                (string)($m['formLabel'] ?? '') . ' ' .
-                (string)($m['listLabel'] ?? '') . ' ' .
-                (string)($m['filterLabel'] ?? '')
-            ));
-            if (str_contains($labels, 'инн') || str_contains($labels, 'inn')) return $code;
-        }
-        return null;
-    }
-
-    private function resolveUserFields(array $ufData, array $meta): array
-    {
-        $out = [];
-        foreach ($ufData as $code => $val) {
-            if ($val === null) continue;
-            $m = $meta[$code] ?? null;
-            if ($m === null) { $out[$code] = $val; continue; }
-
-            $type = $m['type'] ?? 'string';
-            $isMultiple = !empty($m['isMultiple']);
-
-            switch ($type) {
-                case 'enumeration': $out[$code] = $this->resolveEnum($val, $m, $isMultiple); break;
-                case 'double':      $out[$code] = $this->resolveDouble($val, $isMultiple);   break;
-                case 'integer':     $out[$code] = $this->resolveInteger($val, $isMultiple);  break;
-                case 'boolean':     $out[$code] = $this->resolveBoolean($val, $isMultiple);  break;
-                case 'address':     $out[$code] = $this->resolveAddress($val, $isMultiple);  break;
-                default:
-                    $out[$code] = $isMultiple ? (array)$val : (is_array($val) ? reset($val) : $val);
-            }
-        }
-        return $out;
-    }
-
-    private function resolveEnum(mixed $input, array $fieldMeta, bool $isMultiple): mixed
-    {
-        $items = $fieldMeta['items'] ?? [];
-
-        if (empty($items)) {
-            if ($isMultiple) {
-                $arr = is_array($input) ? $input : [$input];
-                $ids = [];
-                foreach ($arr as $v) if (is_numeric($v)) $ids[] = (int)$v;
-                if ($ids === []) throw new InvalidArgumentException("Enum: items missing, provide numeric IDs");
-                return $ids;
-            }
-            if (is_numeric($input)) return (int)$input;
-            throw new InvalidArgumentException("Enum: items missing, provide numeric ID");
-        }
-
-        $byId = $byValue = [];
-        foreach ($items as $it) {
-            $id  = (string)($it['ID'] ?? '');
-            $val = (string)($it['VALUE'] ?? '');
-            if ($id !== '')  $byId[$id] = $id;
-            if ($val !== '') $byValue[$this->lower(trim($val))] = $id;
-        }
-
-        $mapOne = function ($v) use ($byId, $byValue) {
-            $s = is_scalar($v) ? trim((string)$v) : '';
-            if ($s === '') return null;
-            if (ctype_digit($s) && isset($byId[$s])) return (int)$s;
-            $key = $this->lower($s);
-            if (isset($byValue[$key])) return (int)$byValue[$key];
-            throw new InvalidArgumentException("Enum value '{$s}' not found");
-        };
-
-        if ($isMultiple) {
-            $arr = is_array($input) ? $input : [$input];
-            $ids = [];
-            foreach ($arr as $v) { $id = $mapOne($v); if ($id !== null) $ids[] = $id; }
-            return $ids;
-        }
-        $v  = is_array($input) ? reset($input) : $input;
-        $id = $mapOne($v);
-        if ($id === null) throw new InvalidArgumentException("Enum expects non-empty value");
-        return $id;
-    }
-
-    private function resolveDouble(mixed $input, bool $isMultiple): mixed
-    {
-        $toFloat = function ($v) {
-            if ($v === null || $v === '') return null;
-            if (is_numeric($v)) return (float)$v;
-            $s = str_replace(',', '.', (string)$v);
-            if (is_numeric($s)) return (float)$s;
-            throw new InvalidArgumentException("Invalid double: {$v}");
-        };
-        if ($isMultiple) {
-            $arr = is_array($input) ? $input : [$input];
-            $out = [];
-            foreach ($arr as $v) { $f = $toFloat($v); if ($f !== null) $out[] = $f; }
-            return $out;
-        }
-        $f = $toFloat(is_array($input) ? reset($input) : $input);
-        return $f ?? 0.0;
-    }
-
-    private function resolveInteger(mixed $input, bool $isMultiple): mixed
-    {
-        $toInt = function ($v) {
-            if ($v === null || $v === '') return null;
-            if (is_numeric($v)) return (int)$v;
-            throw new InvalidArgumentException("Invalid integer: {$v}");
-        };
-        if ($isMultiple) {
-            $arr = is_array($input) ? $input : [$input];
-            $out = [];
-            foreach ($arr as $v) { $i = $toInt($v); if ($i !== null) $out[] = $i; }
-            return $out;
-        }
-        $i = $toInt(is_array($input) ? reset($input) : $input);
-        return $i ?? 0;
-    }
-
-    private function resolveBoolean(mixed $input, bool $isMultiple): mixed
-    {
-        $toBit = function ($v): string {
-            if (is_array($v)) $v = reset($v);
-            if (is_bool($v)) return $v ? '1' : '0';
-            $s = $this->lower(trim((string)$v));
-            if ($s === '' || $s === '0' || $s === 'n' || $s === 'no' || $s === 'false' || $s === 'off') return '0';
-            return '1'; // всё остальное трактуем как true: '1','y','yes','true','on'
-        };
-        if ($isMultiple) {
-            $arr = is_array($input) ? $input : [$input];
-            return array_map($toBit, $arr);
-        }
-        return $toBit($input);
-    }
-
-    private function resolveAddress(mixed $input, bool $isMultiple): mixed
-    {
-        $toStr = function ($v): string {
-            if (is_array($v)) $v = implode(', ', array_filter(array_map('strval', $v)));
-            return trim((string)$v);
-        };
-        if ($isMultiple) {
-            $arr = is_array($input) ? $input : [$input];
-            return array_map($toStr, $arr);
-        }
-        return $toStr($input);
-    }
-
-    /* ==================== ТРАНСПОРТ ==================== */
-
-    private function call(string $method, array $params): array
-    {
-        $url = $this->baseUrl . $method;
-        $payload = http_build_query($params);
-
-        $attempts = 3;
-        $delayMs = 300;
-
-        while ($attempts-- > 0) {
-            $ch = curl_init($url);
-            if ($ch === false) throw new RuntimeException('curl_init failed');
-
-            curl_setopt_array($ch, [
-                CURLOPT_POST           => true,
-                CURLOPT_POSTFIELDS     => $payload,
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_CONNECTTIMEOUT => 5,
-                CURLOPT_TIMEOUT        => 20,
-                CURLOPT_HTTPHEADER     => ['Content-Type: application/x-www-form-urlencoded'],
-            ]);
-
-            $raw   = curl_exec($ch);
-            $errno = curl_errno($ch);
-            $err   = curl_error($ch);
-            $code  = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
-
-            if ($errno !== 0 || $raw === false || $raw === '') {
-                if ($attempts > 0) { usleep($delayMs * 1000); $delayMs *= 2; continue; }
-                $msg = $errno !== 0 ? "cURL error ({$errno}): {$err}" : "Empty response from Bitrix (HTTP {$code})";
-                throw new RuntimeException($msg);
-            }
-
-            $json = json_decode($raw, true);
-            if (!is_array($json)) {
-                if ($attempts > 0) { usleep($delayMs * 1000); $delayMs *= 2; continue; }
-                throw new RuntimeException("Invalid JSON from Bitrix: {$raw}");
-            }
-
-            if (isset($json['error'])) {
-                $errCode = (string)($json['error'] ?? '');
-                $transient = ($code === 429)
-                    || str_contains($errCode, 'TOO_MANY_REQUESTS')
-                    || str_contains($errCode, 'METHOD_QUOTA_EXCEEDED')
-                    || str_contains($errCode, 'TEMPORARY_UNAVAILABLE');
-                if ($attempts > 0 && $transient) { usleep($delayMs * 1000); $delayMs *= 2; continue; }
-                $desc = $json['error_description'] ?? $json['error'];
-                throw new RuntimeException("Bitrix error: {$desc}");
-            }
-
-            return $json;
-        }
-
-        throw new RuntimeException("Bitrix call failed");
-    }
-
-    /* ==================== УТИЛЬ ==================== */
-
-    private function normalizePhone(string $phone): string
-    {
-        $digits = preg_replace('/\D+/', '', $phone) ?? '';
-        if ($digits === '') return $phone;
-        if (strlen($digits) === 11 && ($digits[0] === '7' || $digits[0] === '8')) return '+7' . substr($digits, 1);
-        if ($digits[0] !== '0') return '+' . $digits;
-        return $phone;
-    }
-
-    private function normalizeEmail(string $email): string
-    {
-        return strtolower(trim($email));
-    }
-
-    private function parseFloatOrNull(mixed $v): ?float
-    {
-        if ($v === null || $v === '') return null;
-        if (is_numeric($v)) return (float)$v;
-        $s = str_replace(',', '.', (string)$v);
-        return is_numeric($s) ? (float)$s : null;
-    }
-
-    private function formatCompanySummary(string $title, string $inn, string $phone, string $email, string $addr): string
-    {
-        $lines = [];
-        if ($title !== '') $lines[] = "Компания: {$title}";
-        if ($inn   !== '') $lines[] = "ИНН: {$inn}";
-        if ($phone !== '') $lines[] = "Телефон: {$phone}";
-        if ($email !== '') $lines[] = "Email: {$email}";
-        if ($addr  !== '') $lines[] = "Юр. адрес: {$addr}";
-        return implode("\n", $lines);
-    }
-
-    private function lower(string $s): string
-    {
-        return function_exists('mb_strtolower') ? mb_strtolower($s, 'UTF-8') : strtolower($s);
-    }
-
-    private function toBool(mixed $v): string
-    {
-        if (is_bool($v)) return $v ? '1' : '0';
-        $s = $this->lower(trim((string)$v));
-        if ($s === '' || $s === '0' || $s === 'n' || $s === 'no' || $s === 'false' || $s === 'off') return '0';
-        return '1'; // всё остальное считаем true
+    } catch (Throwable $e) {
+        $error = $e->getMessage();
     }
 }
+?>
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CRM форма → Bitrix</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#151823; --muted:#9aa4b2; --text:#e8eef7; --acc:#6ea8fe; --acc2:#22d3ee; --danger:#ef4444; --ok:#10b981;
+    --ring: 0 0 0 2px rgba(110,168,254,.35);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:linear-gradient(180deg,#0d1017,#0b0e13 60%);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial}
+  .container{max-width:980px;margin:40px auto;padding:0 16px}
+  .card{background:linear-gradient(180deg,#161a24,#121521);border:1px solid #232836;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+  .card .hd{padding:18px 20px;border-bottom:1px solid #232836;display:flex;align-items:center;gap:12px}
+  .badge{font-size:12px;padding:2px 8px;border-radius:999px;background:#1f2432;color:#8aa0b2;border:1px solid #2a3142}
+  .body{padding:20px}
+  .row{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}
+  .col-6{grid-column:span 6} .col-12{grid-column:span 12} .col-4{grid-column:span 4} .col-3{grid-column:span 3} .col-8{grid-column:span 8}
+  @media (max-width:860px){ .col-6,.col-4,.col-3,.col-8{grid-column:span 12} }
+  label{display:block;font-weight:600;margin:10px 0 6px;color:#b8c4d6}
+  input[type=text],input[type=number],select,textarea{
+    width:100%; padding:12px 14px; background:#0f1320; border:1px solid #232836; color:var(--text); border-radius:12px; outline:none;
+  }
+  textarea{min-height:84px;resize:vertical}
+  input:focus,select:focus,textarea:focus{box-shadow:var(--ring);border-color:#2f71ff}
+  .hint{color:var(--muted);font-size:12px;margin-top:6px}
+  .switch{display:inline-flex;gap:10px;background:#0f1320;border:1px solid #232836;padding:6px;border-radius:12px}
+  .switch input{display:none}
+  .pill{padding:8px 12px;border-radius:8px;border:1px solid transparent;cursor:pointer;color:#b8c4d6}
+  .switch input:checked + .pill{background:#173059;border-color:#274a8a;color:#cfe3ff}
+  .checks{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid #273049;background:#0f1320;border-radius:999px}
+  .chip input{accent-color:#79a6ff}
+  .actions{display:flex;gap:12px;align-items:center;margin-top:10px}
+  .btn{appearance:none;border:1px solid #2b3350;background:#1a2140;color:#e7f0ff;border-radius:12px;padding:12px 16px;font-weight:700;cursor:pointer}
+  .btn:hover{filter:brightness(1.08)}
+  .btn.primary{background:linear-gradient(90deg,#2b67f6,#15b4f1); border:none}
+  .note{margin:16px 0;padding:12px 14px;border-radius:12px}
+  .note.ok{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.35)}
+  .note.err{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35)}
+  .gridline{border-top:1px dashed #233047;margin:18px 0}
+  .two{display:flex;gap:12px;flex-wrap:wrap}
+  .two > * {flex:1}
+  .muted{color:#97a3b7}
+  .footer{opacity:.7;font-size:12px;margin-top:14px}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="card">
+    <div class="hd">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M3 3h18v4H3V3Zm0 7h18v11H3V10Zm4 3v5h10v-5H7Z" stroke="#6ea8fe" stroke-width="1.4"/></svg>
+      <div style="font-weight:800">CRM форма → Bitrix</div>
+      <div class="badge">lead / deal</div>
+    </div>
+    <div class="body">
+      <?php if ($result && ($result['ok'] ?? false)): ?>
+        <div class="note ok">Готово. ID = <b><?= (int)$result['id'] ?></b></div>
+      <?php elseif ($error): ?>
+        <div class="note err">Ошибка: <?= htmlspecialchars($error, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?></div>
+      <?php endif; ?>
 
+      <form method="post" autocomplete="off" id="crmForm">
+        <div class="row">
+          <div class="col-6">
+            <label>Что создаём</label>
+            <div class="switch">
+              <label>
+                <input type="radio" name="mode" value="lead" <?= checked(($_POST['mode'] ?? 'lead') === 'lead') ?> />
+                <span class="pill">Лид</span>
+              </label>
+              <label>
+                <input type="radio" name="mode" value="deal" <?= checked(($_POST['mode'] ?? '') === 'deal') ?> />
+                <span class="pill">Сделка</span>
+              </label>
+            </div>
+          </div>
+          <div class="col-6">
+            <label>Кто вы</label>
+            <div class="switch">
+              <label>
+                <input type="radio" name="subject_type" value="person" <?= checked(($_POST['subject_type'] ?? 'person') === 'person') ?> />
+                <span class="pill">Физлицо</span>
+              </label>
+              <label>
+                <input type="radio" name="subject_type" value="company" <?= checked(($_POST['subject_type'] ?? '') === 'company') ?> />
+                <span class="pill">Юрлицо</span>
+              </label>
+            </div>
+          </div>
 
-/* ======== ПРИМЕРЫ ======== */
-$bx = new BitrixClient('https://b24-7d59hz.bitrix24.ru/rest/1/lcupf1tphfngxpnt/');
+          <div class="col-12"><div class="gridline"></div></div>
 
-// Лид: калькулятор (физик)
-// $lead = $bx->createDefaultLeadSafe(
-//   'Заявка (калькулятор)',
-//   ['name'=>'Иван','phone'=>'+7 (999) 9293-7081','email'=>'ittttttt@gnail.com'],
-//   [
-//     'work_types' => ['Вентиляция и кондиционирование','Электрика'],
-//     'place_type' => 'Квартира',
-//     'area'       => '85,2',
-//     'amount'     => 120000,
-//     'has_design' => true,
-//   ],
-//   ['ASSIGNED_BY_ID'=>1,'SOURCE_ID'=>'WEB']
-// );
-// var_dump($lead);
+          <div class="col-6 person-only">
+            <label>Имя*</label>
+            <input type="text" name="name" placeholder="Иван" value="<?= old('name') ?>">
+          </div>
 
-// Лид: юрлицо (счёт)
-$bx->createDefaultLeadSafe(
-  'Запрос счёта',
-  [
-    'type'=>'company','title'=>'ООО "Рога"',
-    'inn'=>'7701234267','phone'=>'+7 495 0000010','email'=>'acc1@roga.ru',
-    'legal_address'=>'123456, Россия, Москва, ул. Пушкина, д. 1',
-  ],
-  [
-    'work_types'      => ['Проектирование','Отопление'],
-    'place_type'      => 'Офис',
-    'area'            => 560,
-    'amount'          => 350000,
-    'payment_purpose' => 'Оплата по договору №42',
-    'has_design'      => false,
-  ],
-  ['ASSIGNED_BY_ID'=>1,'SOURCE_ID'=>'WEB']
-);
+          <div class="col-6 company-only">
+            <label>Название компании*</label>
+            <input type="text" name="company_title" placeholder='ООО "Рога"' value="<?= old('company_title') ?>">
+          </div>
 
-// // Сделка: оплата на сайте (физик)
-// $bx->createDefaultDealSafe(
-//   'Оплата заказа #123',
-//   ['name'=>'Иван','phone'=>'+7 999 111-22-33','email'=>'ivan@ex.com'],
-//   [
-//     'work_types' => [44, 52],   // ID тоже норм
-//     'place_type' => 'Квартира',
-//     'area'       => 85.2,
-//     'amount'     => 120000,
-//     'has_design' => true,
-//   ],
-//   ['CATEGORY_ID'=>0,'STAGE_ID'=>'NEW','ASSIGNED_BY_ID'=>1]
-// );
+          <div class="col-6">
+            <label>Телефон</label>
+            <input type="text" name="phone" placeholder="+7 999 111-22-33" value="<?= old('phone') ?>">
+          </div>
+          <div class="col-6">
+            <label>Email</label>
+            <input type="text" name="email" placeholder="user@example.com" value="<?= old('email') ?>">
+          </div>
+
+          <div class="col-6 company-only">
+            <label>ИНН</label>
+            <input type="text" name="inn" placeholder="7701234567" value="<?= old('inn') ?>">
+          </div>
+          <div class="col-6 company-only">
+            <label>Юридический адрес</label>
+            <input type="text" name="legal_address" placeholder="123456, Россия, Москва, ул. ..." value="<?= old('legal_address') ?>">
+          </div>
+
+          <div class="col-12"><div class="gridline"></div></div>
+
+          <div class="col-12">
+            <label>Виды работ</label>
+            <div class="checks">
+              <?php foreach ($WORK_TYPES as $w): ?>
+                <label class="chip">
+                  <input type="checkbox" name="work_types[]" value="<?= htmlspecialchars($w) ?>"
+                         <?= checked(in_array($w, oldArr('work_types'), true)) ?> >
+                  <span><?= htmlspecialchars($w) ?></span>
+                </label>
+              <?php endforeach; ?>
+            </div>
+            <div class="hint">Можно несколько.</div>
+          </div>
+
+          <div class="col-4">
+            <label>Тип помещения</label>
+            <select name="place_type">
+              <option value="">— не выбрано —</option>
+              <?php foreach ($PLACE_TYPES as $p): ?>
+                <option value="<?= htmlspecialchars($p) ?>" <?= selected(($p === ($_POST['place_type'] ?? ''))) ?>><?= htmlspecialchars($p) ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+
+          <div class="col-4">
+            <label>Площадь (м²)</label>
+            <input type="text" name="area" placeholder="85,2" value="<?= old('area') ?>">
+          </div>
+
+          <div class="col-4">
+            <label>Есть ДП/планировка</label>
+            <div class="switch">
+              <label>
+                <input type="checkbox" name="has_design" value="1" <?= checked(isset($_POST['has_design'])) ?> />
+                <span class="pill">Да</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="col-4">
+            <label>Сумма</label>
+            <input type="text" name="amount" placeholder="120000" value="<?= old('amount') ?>">
+          </div>
+          <div class="col-4">
+            <label>Валюта</label>
+            <select name="currency">
+              <?php foreach (['RUB','USD','EUR'] as $cur): ?>
+                <option value="<?= $cur ?>" <?= selected(($cur === ($_POST['currency'] ?? DEFAULT_CURRENCY))) ?>><?= $cur ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <div class="col-4 company-only">
+            <label>Назначение платежа</label>
+            <input type="text" name="payment_purpose" placeholder="Оплата по договору №..." value="<?= old('payment_purpose') ?>">
+          </div>
+
+          <div class="col-12"><div class="gridline"></div></div>
+
+          <div class="col-6">
+            <label>Заголовок</label>
+            <input type="text" name="title" placeholder="Заявка с формы" value="<?= old('title','Заявка с формы') ?>">
+          </div>
+          <div class="col-3">
+            <label>Ответственный (ID)</label>
+            <input type="number" name="assigned_by_id" min="1" value="<?= old('assigned_by_id', (string)DEFAULT_ASSIGNED_ID) ?>">
+          </div>
+          <div class="col-3">
+            <label>Источник</label>
+            <input type="text" name="source_id" value="<?= old('source_id', DEFAULT_SOURCE_ID) ?>">
+          </div>
+
+          <div class="col-6 deal-only">
+            <label>Категория сделки</label>
+            <input type="number" name="deal_category_id" min="0" value="<?= old('deal_category_id', (string)DEFAULT_DEAL_CAT_ID) ?>">
+          </div>
+          <div class="col-6 deal-only">
+            <label>Стадия сделки</label>
+            <input type="text" name="deal_stage_id" value="<?= old('deal_stage_id', DEFAULT_DEAL_STAGE) ?>">
+          </div>
+
+          <div class="col-12 actions">
+            <button class="btn primary" type="submit">Отправить в Bitrix</button>
+            <div class="muted">мы не создаём контакт/компанию для ЛИДА — первичный по инструкции</div>
+          </div>
+        </div>
+      </form>
+
+      <div class="footer">UI — без внешних библиотек. Поля маппятся по VALUE, Bitrix сам резолвит ID через ваш класс.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const form = document.getElementById('crmForm');
+  const toggle = () => {
+    const mode = form.mode.value; // lead|deal
+    const subj = form.subject_type.value; // person|company
+    document.querySelectorAll('.deal-only').forEach(el => el.style.display = (mode==='deal') ? '' : 'none');
+    document.querySelectorAll('.person-only').forEach(el => el.style.display = (subj==='person') ? '' : 'none');
+    document.querySelectorAll('.company-only').forEach(el => el.style.display = (subj==='company') ? '' : 'none');
+  };
+  form.mode.forEach ? form.mode.forEach(r => r.addEventListener('change', toggle))
+                    : Array.from(form.querySelectorAll('input[name="mode"]')).forEach(r=>r.addEventListener('change', toggle));
+  Array.from(form.querySelectorAll('input[name="subject_type"]')).forEach(r=>r.addEventListener('change', toggle));
+  toggle();
+})();
+</script>
+</body>
+</html>
